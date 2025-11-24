@@ -56,7 +56,7 @@ end
 -- ======================================================================================
 
 Citizen.CreateThread(function()
-    local ADD_DURATION_SECONDS = 60 -- 加算する秒数 (60000ms/1000)
+    local ADD_DURATION_SECONDS = Config.wait / 1000 -- 加算する秒数 (60000ms/1000)
 
     while true do
         Citizen.Wait(Config.wait)
