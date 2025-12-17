@@ -2,7 +2,6 @@ local QBCore = exports['qb-core']:GetCoreObject()
 
 -- ======================================================================================
 -- # 勤務状態変数 (メモリ内: 再起動でリセットされます)
--- citizenid -> {is_onduty = boolean, job = string}
 -- ======================================================================================
 local DutyStatus = {} 
 
@@ -10,26 +9,17 @@ local DutyStatus = {}
 local function IsJobTracked(jobName)
     if not jobName then return false end
     for _, job in ipairs(Config.jobs) do
-        if job == jobName then
-            return true
-        end
+        if job == jobName then return true end
     end
     return false
 end
 
 -- 🛠️ サーバー関数: タイムスタンプを日付文字列に変換
 local function FormatTimestampServer(timestamp)
-    if not timestamp or timestamp == 0 then
-        return 'なし'
-    end
-
-    -- データが数値（Unixタイムスタンプ）であることを前提とする
+    if not timestamp or timestamp == 0 then return 'なし' end
     if type(timestamp) == 'number' then
-        -- サーバーで os.date を使ってフォーマット
         return os.date('%Y-%m-%d %H:%M:%S', timestamp)
     end
-
-    -- データベースにNULLや意図しない文字列が保存されていた場合のフォールバック
     return 'なし'
 end
 
@@ -37,18 +27,47 @@ end
 -- # 内部関数: データベース操作
 -- ======================================================================================
 
---- SQLのlast_clock_in_timeを現在時刻に設定し、レコードが存在しない場合は作成します。（出勤処理）
+--- SQLのlast_clock_in_timeを現在時刻に設定
 local function ClockInSQL(citizenid, job_name)
-    -- 💡 修正: DATETIME形式の文字列を取得
     local currentTimeStr = os.time()
-
-    -- レコードを作成またはlast_clock_in_timeを現在時刻に設定
     MySQL.execute([[
-        INSERT INTO mc_player_duty_logs (citizenid, job, duty_duration_seconds, last_clock_in_time)
-        VALUES (?, ?, 0, ?)
+        INSERT INTO mc_player_duty_logs (citizenid, job, duty_duration_seconds, daily_duty_seconds, last_clock_in_time)
+        VALUES (?, ?, 0, 0, ?)
         ON DUPLICATE KEY UPDATE 
             last_clock_in_time = ?
-    ]], {citizenid, job_name, currentTimeStr, currentTimeStr}) -- 💡 修正: DATETIME文字列を渡す
+    ]], {citizenid, job_name, currentTimeStr, currentTimeStr})
+end
+
+-- 🚨 履歴スライドを実行する関数 (キューがある時だけコルーチンを起動)
+local function ProcessHistoryUpdate(updateQueue)
+    Citizen.CreateThread(function()
+        local current_time = os.time()
+        for _, task in ipairs(updateQueue) do
+            local data = MySQL.prepare.await([[
+                SELECT last_clock_in_time, daily_duty_seconds, duty_history 
+                FROM mc_player_duty_logs WHERE citizenid = ? AND job = ?
+            ]], {task.citizenid, task.job})
+
+            if data then
+                local last_date = os.date("%Y-%m-%d", data.last_clock_in_time)
+                local history = data.duty_history and json.decode(data.duty_history) or {}
+
+                -- 前日分を履歴の先頭に挿入
+                table.insert(history, 1, { date = last_date, seconds = data.daily_duty_seconds })
+                if #history > 14 then table.remove(history) end
+
+                -- DB更新: 当日秒数をリセットし、履歴を保存
+                MySQL.update.await([[
+                    UPDATE mc_player_duty_logs 
+                    SET duty_history = ?, daily_duty_seconds = 0, last_clock_in_time = ?
+                    WHERE citizenid = ? AND job = ?
+                ]], {json.encode(history), current_time, task.citizenid, task.job})
+                
+                print(string.format('HISTORY SHIFT COMPLETED: %s (%s)', task.citizenid, last_date))
+            end
+            Citizen.Wait(100)
+        end
+    end)
 end
 
 -- ======================================================================================
@@ -56,121 +75,105 @@ end
 -- ======================================================================================
 
 Citizen.CreateThread(function()
-    local ADD_DURATION_SECONDS = Config.wait / 1000 -- 加算する秒数 (60000ms/1000)
+    local ADD_SECONDS = Config.wait / 1000
 
     while true do
         Citizen.Wait(Config.wait)
-
         local qbPlayers = QBCore.Functions.GetQBPlayers()
+        local current_time = os.time()
+        local current_date = os.date("%Y-%m-%d", current_time)
 
-        -- 🚨 バッチ更新対象のプレイヤーを格納するテーブル
-        local dutyPlayersToUpdate = {} 
+        local dutyPlayersToUpdate = {} -- バッチ更新用
+        local historyQueue = {}        -- 履歴スライド用
 
         for _, Player in pairs(qbPlayers) do
             local current_onduty = Player.PlayerData.job.onduty
             local current_job = Player.PlayerData.job.name
             local citizenid = Player.PlayerData.citizenid
 
-            -- 1. 勤務状態の確認と初期化
             if not DutyStatus[citizenid] then
-                -- DutyStatusの初期化は常に最新のジョブ名を使用
-                DutyStatus[citizenid] = {is_onduty = false, job = current_job}
+                DutyStatus[citizenid] = {is_onduty = false, job = current_job, last_tick = current_time}
             end
 
             local stored_onduty = DutyStatus[citizenid].is_onduty
             local stored_job = DutyStatus[citizenid].job
-
-            -- =================================================================
-            -- 🛑 2. ジョブ変更および記録対象外チェック (最優先) 🛑
-            -- =================================================================
-
             local current_job_tracked = IsJobTracked(current_job)
 
+            -- ジョブ変更/追跡外チェック
             if stored_job ~= current_job or not current_job_tracked then
-                -- 勤務中だった場合、強制的に退勤処理
                 if stored_onduty then
-                    -- DutyStatusを更新
-                    DutyStatus[citizenid] = {is_onduty = false, job = current_job}
-                    print(string.format('SYNC OUT (Job Change/Untracked): %s がジョブ変更または追跡対象外 (%s -> %s) のため退勤しました。', citizenid, stored_job, current_job))
+                    DutyStatus[citizenid] = {is_onduty = false, job = current_job, last_tick = current_time}
                     goto continue_loop 
                 end
-
-                -- 非番だった場合、DutyStatusのjob名のみを現在のジョブに更新して同期させる
                 DutyStatus[citizenid].job = current_job 
                 goto continue_loop
             end
 
-            -- =================================================================
-            -- 3. 勤務状態の同期と処理 (ジョブが一致/追跡対象の場合のみ)
-            -- =================================================================
-
+            -- 勤務状態の同期と判定
             if current_onduty and not stored_onduty then
-                -- 状態の不一致: 【ゲーム内: 出勤中】 & 【DutyStatus: 非番】 → 出勤処理 (クロックイン)
+                -- 【出勤開始時の判定】
+                local data = MySQL.prepare.await([[
+                    SELECT last_clock_in_time FROM mc_player_duty_logs WHERE citizenid = ? AND job = ?
+                ]], {citizenid, current_job})
 
-                ClockInSQL(citizenid, current_job)
-
+                if data and os.date("%Y-%m-%d", data) ~= current_date then
+                    table.insert(historyQueue, {citizenid = citizenid, job = current_job})
+                else
+                    ClockInSQL(citizenid, current_job)
+                end
                 DutyStatus[citizenid].is_onduty = true
-                print(string.format('SYNC IN: %s (%s) が出勤しました。', citizenid, current_job))
 
             elseif not current_onduty and stored_onduty then
-                -- 状態の不一致: 【ゲーム内: 非番】 & 【DutyStatus: 出勤中】 → 退勤処理 (クロックアウト)
-
-                -- SQLは触らず、last_clock_in_timeは保持されたまま
-
+                -- 退勤
                 DutyStatus[citizenid].is_onduty = false
-                print(string.format('SYNC OUT: %s (%s) が退勤しました。', citizenid, stored_job))
 
             elseif current_onduty and stored_onduty then
-                -- 状態の一致: 【出勤中】 → 勤務時間を加算
+                -- 勤務中：日付変更チェック（0時を跨いだ瞬間）
+                local last_processed_date = os.date("%Y-%m-%d", DutyStatus[citizenid].last_tick)
+                if last_processed_date ~= current_date then
+                    table.insert(historyQueue, {citizenid = citizenid, job = stored_job})
+                end
 
-                -- 🚨 修正: SQLクエリの実行をスキップし、バッチ更新リストに追加
-                table.insert(dutyPlayersToUpdate, {
-                    citizenid = citizenid,
-                    job = stored_job -- 勤務開始時のジョブ名（stored_job）を使用
-                })
+                -- バッチ更新用リスト
+                table.insert(dutyPlayersToUpdate, {citizenid = citizenid, job = stored_job})
             end
-
+            
+            DutyStatus[citizenid].last_tick = current_time
             ::continue_loop::
         end
 
-        -- =================================================================
-        -- 🛑 4. バッチ更新の実行 (ループの外) 🛑
-        -- =================================================================
+        -- 🚨 履歴スライドが必要な場合のみ起動
+        if #historyQueue > 0 then
+            ProcessHistoryUpdate(historyQueue)
+        end
+
+        -- 🛑 バッチ更新の実行
         if #dutyPlayersToUpdate > 0 then
-            local citizenid_cases = {}
-            local citizenid_list = {}
+            local total_cases = {}
+            local daily_cases = {}
+            local where_list = {}
 
             for _, player in ipairs(dutyPlayersToUpdate) do
-                -- CASE WHEN 句用の条件文字列を構築
-                table.insert(citizenid_cases, string.format("WHEN citizenid = '%s' AND job = '%s' THEN duty_duration_seconds + %d", player.citizenid, player.job, ADD_DURATION_SECONDS))
-
-                -- WHERE IN 句用のリストを構築
-                table.insert(citizenid_list, string.format("('%s', '%s')", player.citizenid, player.job))
+                table.insert(total_cases, string.format("WHEN citizenid = '%s' AND job = '%s' THEN duty_duration_seconds + %d", player.citizenid, player.job, ADD_SECONDS))
+                table.insert(daily_cases, string.format("WHEN citizenid = '%s' AND job = '%s' THEN daily_duty_seconds + %d", player.citizenid, player.job, ADD_SECONDS))
+                table.insert(where_list, string.format("('%s', '%s')", player.citizenid, player.job))
             end
 
-            -- バッチクエリを構築
-            local query = [[
+            local final_query = string.format([[
                 UPDATE mc_player_duty_logs
                 SET 
-                    duty_duration_seconds = 
-                        CASE
-                            %s
-                            ELSE duty_duration_seconds
-                        END
+                    duty_duration_seconds = CASE %s ELSE duty_duration_seconds END,
+                    daily_duty_seconds = CASE %s ELSE daily_duty_seconds END,
+                    last_clock_in_time = %d
                 WHERE (citizenid, job) IN (%s);
-            ]]
+            ]], table.concat(total_cases, ' '), table.concat(daily_cases, ' '), current_time, table.concat(where_list, ', '))
 
-            -- SQLクエリ文字列を完成させる
-            local final_query = string.format(query, table.concat(citizenid_cases, ' '), table.concat(citizenid_list, ', '))
-
-            -- 単一のバッチクエリを実行
             MySQL.execute(final_query, {}) 
         end
 
-        -- 接続が切れたプレイヤーのDutyStatusをクリーンアップ
+        -- クリーンアップ
         for citizenid, status in pairs(DutyStatus) do
             if QBCore.Functions.GetPlayerByCitizenId(citizenid) == nil then
-                -- プレイヤーが接続リストにいない場合、メモリ上の状態をリセット
                 DutyStatus[citizenid].is_onduty = false
             end
         end
@@ -312,7 +315,11 @@ RegisterServerEvent('dutyLog:server:getAllDutyDataForBoss', function()
         local placeholders = string.rep('?,', #targetCitizenIds - 1) .. '?'
 
         query_sql = [[
-            SELECT citizenid, duty_duration_seconds, last_clock_in_time 
+            SELECT citizenid, 
+                duty_duration_seconds, 
+                daily_duty_seconds, 
+                duty_history, 
+                last_clock_in_time
             FROM mc_player_duty_logs 
             WHERE job = ? 
             AND citizenid IN (]] .. placeholders .. [[)
@@ -388,6 +395,13 @@ RegisterServerEvent('dutyLog:server:getAllDutyDataForBoss', function()
 
             data.player_name = playerName
             data.last_clock_in_time = FormatTimestampServer(data.last_clock_in_time)
+
+            -- DBから取得した段階ではJSON文字列なので、テーブルにデコードする
+            if data.duty_history and data.duty_history ~= "" then
+                data.duty_history = json.decode(data.duty_history)
+            else
+               data.duty_history = {} -- 履歴がない場合は空のテーブル
+            end
         end
 
     	-- クライアントへ結果を返す (is_bossフラグはここで true で送る)
