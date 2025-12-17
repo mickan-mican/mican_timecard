@@ -41,16 +41,12 @@ RegisterNetEvent('dutyLog:client:requestDutyData', function()
 end)
 
 RegisterNetEvent('dutyLog:client:showDutyMenu', function(logData, isBoss, jobLabel)
-    local options = {} 
-    local myCitizenId = QBCore.PlayerData.citizenid
-    
+    local options = {}
+
     -- 🚨 判定ロジック:
     -- 1. isBoss である
     -- 2. ログの件数が1件ではない (全員分である可能性が高い)
-    -- 3. または、ログの最初のCitizen IDが自分自身ではない (全員分である可能性が高い)
     local isShowingAllLogs = isBoss and #logData > 1
-
-    local is_single_log = #logData == 1 and logData[1].citizenid == myCitizenId
 
     if isBoss then
         if isShowingAllLogs then
@@ -63,7 +59,7 @@ RegisterNetEvent('dutyLog:client:showDutyMenu', function(logData, isBoss, jobLab
                 -- 最初のメニューを開くサーバーイベントをトリガー
                 serverEvent = 'dutyLog:server:getDutyDataForMenu' 
             })
-        elseif is_single_log then
+        else
             -- 以前の修正: 自分自身のログ表示中に「全員表示」ボタンを追加
             table.insert(options, {
                 title = '💼 全従業員の勤務状況を表示',
